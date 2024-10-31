@@ -8,7 +8,28 @@
 
     <ImageView
         android:id="@+id/iv_image"
-        android:layout_width="700dp"
-        android:layout_height="700dp" />
+        android:layout_width="192dp"
+        android:layout_height="108dp" />
 
+
+    <Button
+        android:id="@+id/btn_open"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Open"
+        android:textAllCaps="false" />
+
+    <Button
+        android:id="@+id/btn_close"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Close"
+        android:textAllCaps="false" />
+
+    <Button
+        android:id="@+id/btn_open_close"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Open-Close"
+        android:textAllCaps="false" />
 </LinearLayout>

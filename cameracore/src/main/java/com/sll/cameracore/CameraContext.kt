@@ -4,14 +4,18 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
-import android.hardware.camera2.*
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCaptureSession.CaptureCallback
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
+import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.Log
 import android.util.Size
 import android.view.Surface
 import androidx.core.os.ExecutorCompat
@@ -26,13 +30,20 @@ class CameraContext {
     private val applicationContext = ContextProvider.applicationContext
     private val mCameraManager =
         applicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    private val mCameraThread: HandlerThread = HandlerThread("camera-thread")
+    private val mCameraCallbackThread: HandlerThread = HandlerThread("camera-callback-thread")
         .apply {
             start()
         }
-    private val mCameraHandler: Handler = Handler(mCameraThread.looper)
-    private val mCameraExecutor = ExecutorCompat.create(mCameraHandler)
+    private val mCameraCallbackHandler: Handler = Handler(mCameraCallbackThread.looper)
+    private val mCameraCallbackExecutor = ExecutorCompat.create(mCameraCallbackHandler)
     private val mCameraOpenCloseLock = CameraLock(1)
+
+    private val mCameraOperationThread: HandlerThread = HandlerThread("camera-operation-thread")
+        .apply {
+            start()
+        }
+    private val mCameraOperationHandler: Handler = Handler(mCameraOperationThread.looper)
+    private val mCameraOperationExecutor = SerialExecutor(mCameraOperationHandler)
 
     private var mCameraDevice: CameraDevice? = null
     private var mCaptureSession: CameraCaptureSession? = null
@@ -44,6 +55,7 @@ class CameraContext {
         }
     private val mImageHandler = Handler(mImageThread.looper)
     private var mImageReader: ImageReader? = null
+    private val mImageLockObject = Object()
     private var mOutputConfiguration: OutputConfiguration? = null
     private val mImageByteListenerList = ArrayList<OnImageByteListener>()
     private val mIsNeedLogFirstFrame = AtomicBoolean(false)
@@ -52,17 +64,19 @@ class CameraContext {
     private val mPreviewImageAvailableListener = object : ImageReader.OnImageAvailableListener {
 
         override fun onImageAvailable(reader: ImageReader) {
-            val image = reader.acquireLatestImage() ?: return
-            if (image.format != IMAGE_FORMAT) return
-            if (mIsNeedLogFirstFrame.compareAndSet(true, false)) {
-                Log.d(TAG, "first frame come")
-            }
-            mImageByteListenerList.forEach {
-                it.onImageAvailable(image)
-            }
-            try {
-                image.close()
-            } catch (ignore: Exception) {
+            synchronized(mImageLockObject) {
+                val image = reader.acquireLatestImage() ?: return
+                if (image.format != IMAGE_FORMAT) return
+                if (mIsNeedLogFirstFrame.compareAndSet(true, false)) {
+                    LogUtil.d(TAG, "first frame come")
+                }
+                mImageByteListenerList.forEach {
+                    it.onImageAvailable(image)
+                }
+                try {
+                    image.close()
+                } catch (ignore: Exception) {
+                }
             }
         }
     }
@@ -70,18 +84,18 @@ class CameraContext {
     private val mSessionCallback = object : CameraCaptureSession.StateCallback() {
 
         override fun onConfigured(session: CameraCaptureSession) {
-            Log.d(TAG, "onConfigured: $session")
+            LogUtil.d(TAG, "onConfigured: $session")
             mCaptureSession = session
             configPreviewRequest()
         }
 
         override fun onConfigureFailed(session: CameraCaptureSession) {
-            Log.d(TAG, "onConfigureFailed: $session")
+            LogUtil.d(TAG, "onConfigureFailed: $session")
         }
 
         override fun onClosed(session: CameraCaptureSession) {
             super.onClosed(session)
-            Log.d(TAG, "session $session has closed")
+            LogUtil.d(TAG, "session $session has closed")
         }
     }
 
@@ -111,26 +125,29 @@ class CameraContext {
     }
 
     fun openCamera(cameraId: Int) {
-        mCameraExecutor.execute {
+        mCameraOperationExecutor.execute {
             try {
                 val id = cameraId.toString()
-                Log.d(TAG, "open camera [${id}]")
+                LogUtil.d(TAG, "open camera [${id}]")
                 mCameraOpenCloseLock.tryAcquire("openCamera")
-                mCameraManager.openCamera(id, mCameraStateCallback, null)
+                mCameraManager.openCamera(id, mCameraStateCallback, mCameraCallbackHandler)
             } catch (e: Exception) {
                 e.printStackTrace()
                 mCameraOpenCloseLock.release("openCamera in exception")
-                Log.d(TAG, "open camera failed")
+                LogUtil.d(TAG, "open camera failed")
             }
         }
     }
 
     fun closeCamera() {
-        mCameraExecutor.execute {
+        mCameraOperationExecutor.clear()
+        mCameraOperationExecutor.execute {
             try {
                 mCameraOpenCloseLock.tryAcquire("close camera")
-                logClose(mImageReader, tag = "imagereader")
-                mImageReader = null
+                synchronized(mImageLockObject) {
+                    logClose(mImageReader, tag = "imagereader")
+                    mImageReader = null
+                }
                 mCaptureSession?.stopRepeating()
                 logClose(mCaptureSession, tag = "session")
                 mCaptureSession = null
@@ -157,8 +174,12 @@ class CameraContext {
     }
 
     private fun startPreview(size: Size) {
-        mCameraExecutor.execute {
-            Log.d(TAG, "startPreview: size = $size")
+        mCameraOperationExecutor.execute {
+            LogUtil.d(TAG, "startPreview: size = $size")
+            if (mCameraDevice == null) {
+                LogUtil.d(TAG, "startPreview: camera device is null, maybe already closed")
+                return@execute
+            }
             val outputs = ArrayList<OutputConfiguration>()
 
             mImageReader = newImageReader(size)
@@ -169,15 +190,15 @@ class CameraContext {
             val sessionConfig = SessionConfiguration(
                 SessionConfiguration.SESSION_REGULAR,
                 outputs,
-                mCameraExecutor,
+                mCameraCallbackExecutor,
                 mSessionCallback
             )
-            Log.d(TAG, "createCaptureSession")
+            LogUtil.d(TAG, "createCaptureSession")
             try {
                 mCameraDevice?.createCaptureSession(sessionConfig)
             } catch (e: Exception) {
                 e.printStackTrace()
-                Log.d(TAG, "startPreview: config streams error")
+                LogUtil.d(TAG, "startPreview: config streams error")
             }
         }
     }
@@ -201,7 +222,7 @@ class CameraContext {
         try {
             val request =
                 mCameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW) ?: kotlin.run {
-                    Log.d(TAG, "buildPreviewRequest: camera device is null")
+                    LogUtil.d(TAG, "buildPreviewRequest: camera device is null")
                     return
                 }
             request.addTarget(mImageReader!!.surface)
@@ -209,11 +230,11 @@ class CameraContext {
             mCaptureSession?.setRepeatingRequest(
                 request.build(),
                 mPreviewCaptureCallback,
-                mCameraHandler
+                mCameraCallbackHandler
             )
         } catch (e: Exception) {
             e.printStackTrace()
-            Log.d(TAG, "configPreviewRequest: config streams error")
+            LogUtil.d(TAG, "configPreviewRequest: config streams error")
         }
     }
 
@@ -225,7 +246,7 @@ class CameraContext {
             failure: CaptureFailure
         ) {
             super.onCaptureFailed(session, request, failure)
-            Log.d(TAG, "onCaptureFailed: ")
+            LogUtil.d(TAG, "onCaptureFailed: ")
         }
 
         override fun onCaptureBufferLost(
@@ -235,21 +256,21 @@ class CameraContext {
             frameNumber: Long
         ) {
             super.onCaptureBufferLost(session, request, target, frameNumber)
-            Log.d(TAG, "onCaptureBufferLost: ")
+            LogUtil.d(TAG, "onCaptureBufferLost: ")
         }
     }
 
     private fun logClose(closeable: AutoCloseable?, tag: String = closeable?.toString() ?: "") {
         try {
             if (closeable != null) {
-                Log.d(TAG, "$tag close start")
+                LogUtil.d(TAG, "$tag close start")
                 closeable.close()
-                Log.d(TAG, "$tag close complete")
+                LogUtil.d(TAG, "$tag close complete")
             } else {
-                Log.e(TAG, "$tag is null, not exec close")
+                LogUtil.e(TAG, "$tag is null, not exec close")
             }
         } catch (e: Exception) {
-            Log.d(TAG, "$tag close error, ${e.message}")
+            LogUtil.d(TAG, "$tag close error, ${e.message}")
             e.printStackTrace()
         }
     }

@@ -9,6 +9,7 @@ import android.graphics.YuvImage
 import android.media.Image
 import android.os.Bundle
 import android.util.Size
+import android.widget.Button
 import android.widget.ImageView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,7 +26,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var mIvPreview: ImageView
 
-    private val mPreviewSizes = arrayOf(Size(2560, 1600))
+    private val mPreviewSizes = arrayOf(Size(1920, 1080))
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,6 +76,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        findViewById<Button>(R.id.btn_open).setOnClickListener {
+            openCamera()
+        }
+
+        findViewById<Button>(R.id.btn_close).setOnClickListener {
+            mCameraContext.closeCamera()
+        }
+
+        findViewById<Button>(R.id.btn_open_close).setOnClickListener {
+            openCamera()
+            mCameraContext.closeCamera()
+        }
     }
 
     override fun onResume() {
